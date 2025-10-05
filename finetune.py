@@ -9,6 +9,21 @@ from transformers.integrations import TensorBoardCallback
 from datasets import load_dataset
 import torch
 import math
+import os
+from datetime import datetime
+
+logs_base = "./logs/runs"
+os.makedirs(logs_base, exist_ok=True)
+
+timestamp = datetime.now().strftime("%m%d_%H%M")
+run_name = f"run_{timestamp}"
+logging_dir = os.path.join(logs_base, run_name)
+
+
+
+
+
+
 
 tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 model = AutoModelForMaskedLM.from_pretrained("distilbert-base-uncased")
@@ -59,8 +74,6 @@ tokenizer.pad_token = tokenizer.sep_token
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
 
 
-
-
 # training
 
 class TensorBoardCallback(TensorBoardCallback):
@@ -94,7 +107,7 @@ training_args = TrainingArguments(
     per_device_eval_batch_size=64,
     num_train_epochs=3,
     weight_decay=0.01,
-    logging_dir="./logs",
+    logging_dir=logging_dir,
     report_to=["tensorboard"],
     logging_steps=20,
     save_strategy="steps",
@@ -118,4 +131,4 @@ trainer.train()
 # Save the best model
 trainer.save_model()
 tokenizer.save_pretrained(training_args.output_dir)
-print(f"Best model saved to: {training_args.output_dir}")
+
