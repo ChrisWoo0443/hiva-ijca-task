@@ -114,3 +114,8 @@ trainer = Trainer(
 )
 
 trainer.train()
+
+# Save the best model
+trainer.save_model()
+tokenizer.save_pretrained(training_args.output_dir)
+print(f"Best model saved to: {training_args.output_dir}")
