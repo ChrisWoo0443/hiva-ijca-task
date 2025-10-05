@@ -1,6 +1,6 @@
 # pyproject.toml
 [project]
-name = "squadv2-finetune"
+name = "finetune"
 version = "0.1.0"
 description = "Finetune DistilBERT on Squadv2 for Mlm"
 requires-python = ">=3.9"
