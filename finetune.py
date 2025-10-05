@@ -4,9 +4,10 @@ This finetuning script is taken from the above colab notebook
 '''
 
 from transformers import AutoModelForMaskedLM, AutoTokenizer, Trainer, TrainingArguments
-from transformers import DataCollatorForLanguageModeling
+from transformers import DataCollatorForLanguageModeling, TrainerCallback
 from datasets import load_dataset
 import torch
+import math
 
 tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 model = AutoModelForMaskedLM.from_pretrained("distilbert-base-uncased")
@@ -83,6 +84,7 @@ training_args = TrainingArguments(
     num_train_epochs=3,
     weight_decay=0.01,
     logging_dir="./logs",
+    report_to=["tensorboard"],
     logging_steps=20,
     save_strategy="steps",
     save_steps=1000,
@@ -96,7 +98,7 @@ trainer = Trainer(
     eval_dataset=lm_dataset["test"],
     data_collator=data_collator,
     tokenizer=tokenizer,
-    allbacks=[PerplexityCallback()],
+    callbacks=[PerplexityCallback()],
 )
 
 trainer.train()
