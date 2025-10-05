@@ -5,6 +5,7 @@ This finetuning script is taken from the above colab notebook
 
 from transformers import AutoModelForMaskedLM, AutoTokenizer, Trainer, TrainingArguments
 from transformers import DataCollatorForLanguageModeling, TrainerCallback
+from transformers.integrations import TensorBoardCallback
 from datasets import load_dataset
 import torch
 import math
@@ -38,7 +39,7 @@ Load dataset
 split 80/20 train/test
 flatten because text is nested in answer
 '''
-eli5 = load_dataset("eli5", split="train[:1%]")
+eli5 = load_dataset("dany0407/eli5_category", split="train")
 eli5 = eli5.train_test_split(test_size=0.2)
 eli5 = eli5.flatten()
 
@@ -54,7 +55,7 @@ tokenized_eli5 = eli5.map(
 # group texts into chunks of block_size and create a batch of examples
 lm_dataset = tokenized_eli5.map(group_texts, batched=True, num_proc=4)
 
-tokenizer.pad_token = tokenizer.eos_token
+tokenizer.pad_token = tokenizer.sep_token
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
 
 
@@ -62,33 +63,44 @@ data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probabi
 
 # training
 
-class PerplexityCallback(TrainerCallback):
-    """A callback to compute and log perplexity after evaluation."""
-    
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if metrics and "eval_loss" in metrics:
-            try:
-                perplexity = math.exp(metrics["eval_loss"])
-                metrics["eval_perplexity"] = perplexity
-                print(f"Perplexity: {perplexity:.4f}")
-            except OverflowError:
-                metrics["eval_perplexity"] = float("inf")
-                print("Perplexity: inf")
+class TensorBoardCallback(TensorBoardCallback):
+    """Custom TensorBoard callback that adds perplexity metrics."""
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Add perplexity before TensorBoard logging."""
+        if logs is not None:
+            if "loss" in logs:
+                try:
+                    logs["train_perplexity"] = math.exp(logs["loss"])
+                except (OverflowError, ValueError):
+                    logs["train_perplexity"] = float("inf")
+
+            if "eval_loss" in logs:
+                try:
+                    logs["eval_perplexity"] = math.exp(logs["eval_loss"])
+                except (OverflowError, ValueError):
+                    logs["eval_perplexity"] = float("inf")
+
+        # Call parent to actually log to TensorBoard
+        super().on_log(args, state, control, logs=logs, **kwargs)
 
 
 training_args = TrainingArguments(
     output_dir="./outputs/distilbert-finetuned-eli5-mlm",
     eval_strategy="steps",
-    eval_steps=100,
+    eval_steps=1000,
     learning_rate=2e-5,
+    per_device_train_batch_size=64,
+    per_device_eval_batch_size=64,
     num_train_epochs=3,
     weight_decay=0.01,
     logging_dir="./logs",
     report_to=["tensorboard"],
     logging_steps=20,
     save_strategy="steps",
-    save_steps=1000,
-
+    save_steps=2000,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_perplexity",
 )
 
 trainer = Trainer(
@@ -98,7 +110,7 @@ trainer = Trainer(
     eval_dataset=lm_dataset["test"],
     data_collator=data_collator,
     tokenizer=tokenizer,
-    callbacks=[PerplexityCallback()],
+    callbacks=[CustomTensorBoardCallback()],
 )
 
 trainer.train()
