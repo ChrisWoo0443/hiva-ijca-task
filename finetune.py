@@ -12,16 +12,12 @@ import math
 import os
 from datetime import datetime
 
-logs_base = "./logs/runs"
+logs_base = "./logs"
 os.makedirs(logs_base, exist_ok=True)
 
 timestamp = datetime.now().strftime("%m%d_%H%M")
 run_name = f"run_{timestamp}"
 logging_dir = os.path.join(logs_base, run_name)
-
-
-
-
 
 
 
