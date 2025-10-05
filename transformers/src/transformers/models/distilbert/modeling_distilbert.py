@@ -265,6 +265,7 @@ class TransformerBlock(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        output_residuals: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, ...]:
         # Self-Attention
@@ -273,12 +274,24 @@ class TransformerBlock(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             **kwargs,
         )
+        # Calculate attention residual before normalization
+        attn_residual = attention_output if output_residuals else None
         attention_output = self.sa_layer_norm(attention_output + hidden_states)
+
+        # Store hidden state after attention for MI calculation
+        hidden_after_attn = attention_output if output_residuals else None
 
         # Feed Forward Network
         ffn_output = self.ffn(attention_output)
+        # Calculate FFN residual before normalization
+        ffn_residual = ffn_output if output_residuals else None
         ffn_output = self.output_layer_norm(ffn_output + attention_output)
 
+        # Store final hidden state after full layer for MI calculation
+        hidden_after_layer = ffn_output if output_residuals else None
+
+        if output_residuals:
+            return ffn_output, attn_residual, ffn_residual, hidden_after_attn, hidden_after_layer
         return ffn_output
 
 
@@ -293,16 +306,38 @@ class Transformer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        output_residuals: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[BaseModelOutput]:
+        all_attn_residuals = [] if output_residuals else None
+        all_ffn_residuals = [] if output_residuals else None
+        all_hidden_after_attn = [] if output_residuals else None
+        all_hidden_after_layer = [] if output_residuals else None
+
         for layer_module in self.layer:
-            hidden_states = layer_module(
+            layer_output = layer_module(
                 hidden_states,
                 attention_mask,
+                output_residuals=output_residuals,
                 **kwargs,
             )
 
-        return BaseModelOutput(last_hidden_state=hidden_states)
+            if output_residuals:
+                hidden_states, attn_residual, ffn_residual, hidden_after_attn, hidden_after_layer = layer_output
+                all_attn_residuals.append(attn_residual)
+                all_ffn_residuals.append(ffn_residual)
+                all_hidden_after_attn.append(hidden_after_attn)
+                all_hidden_after_layer.append(hidden_after_layer)
+            else:
+                hidden_states = layer_output
+
+        output = BaseModelOutput(last_hidden_state=hidden_states)
+        if output_residuals:
+            output.attn_residuals = all_attn_residuals
+            output.ffn_residuals = all_ffn_residuals
+            output.hidden_after_attn = all_hidden_after_attn
+            output.hidden_after_layer = all_hidden_after_layer
+        return output
 
 
 # INTERFACE FOR ENCODER AND TASK SPECIFIC MODEL #
@@ -420,6 +455,7 @@ class DistilBertModel(DistilBertPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        output_residuals: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[BaseModelOutput, tuple[torch.Tensor, ...]]:
         r"""
@@ -434,6 +470,8 @@ class DistilBertModel(DistilBertPreTrainedModel):
             Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
             is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
             model's internal embedding lookup matrix.
+        output_residuals (`bool`, *optional*, defaults to `False`):
+            Whether to return attention and FFN residuals for each layer.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -448,6 +486,7 @@ class DistilBertModel(DistilBertPreTrainedModel):
         return self.transformer(
             hidden_states=embeddings,
             attention_mask=attention_mask,
+            output_residuals=output_residuals,
             **kwargs,
         )
 
@@ -496,6 +535,12 @@ class DistilBertForMaskedLM(DistilBertPreTrainedModel):
 
         self.mlm_loss_fct = nn.CrossEntropyLoss()
 
+        # MI penalty coefficient (set to 0 to disable, > 0 to penalize redundancy)
+        self.mi_penalty_weight = getattr(config, 'mi_penalty_weight', 0.0)
+
+        # CLUB estimators for MI penalty (lazy initialized)
+        self.club_estimators = None
+
     def get_position_embeddings(self) -> nn.Embedding:
         """
         Returns the position embeddings
@@ -522,6 +567,77 @@ class DistilBertForMaskedLM(DistilBertPreTrainedModel):
     def set_output_embeddings(self, new_embeddings: nn.Module):
         self.vocab_projector = new_embeddings
 
+    def _initialize_club_estimators(self, device):
+        """Initialize CLUB estimators for MI penalty calculation."""
+        from CLUB.mi_estimators import CLUB
+
+        self.club_estimators = nn.ModuleDict()
+        hidden_dim = self.config.dim
+        num_layers = self.config.n_layers
+        hidden_size = 512
+
+        for i in range(num_layers - 1):
+            self.club_estimators[f'hidden_{i}_{i+1}'] = CLUB(
+                hidden_dim, hidden_dim, hidden_size
+            ).to(device)
+
+        # Optimizers for CLUB estimators
+        self.club_optimizers = {}
+        for name, estimator in self.club_estimators.items():
+            self.club_optimizers[name] = torch.optim.Adam(estimator.parameters(), lr=1e-4)
+
+    def _flatten_and_subsample(self, hidden_states, max_samples=512):
+        """Flatten and subsample hidden states for MI calculation."""
+        batch_size, seq_length, hidden_dim = hidden_states.shape
+        flattened = hidden_states.reshape(batch_size * seq_length, hidden_dim)
+
+        num_samples = flattened.shape[0]
+        if num_samples > max_samples:
+            indices = torch.randperm(num_samples, device=flattened.device)[:max_samples]
+            flattened = flattened[indices]
+
+        return flattened
+
+    def calculate_mi_penalty(self, hidden_after_layer):
+        """
+        Calculate MI penalty to discourage redundant information across layers.
+
+        Args:
+            hidden_after_layer: List of hidden states, one per layer
+
+        Returns:
+            mi_penalty: Scalar penalty value (sum of MI between adjacent layers)
+        """
+        if self.mi_penalty_weight == 0.0:
+            return 0.0
+
+        # Lazy initialize CLUB estimators
+        if self.club_estimators is None:
+            self._initialize_club_estimators(hidden_after_layer[0].device)
+
+        num_layers = len(hidden_after_layer)
+        mi_penalty = 0.0
+
+        # Train CLUB estimators (a few iterations)
+        for _ in range(3):  # Quick training
+            for i in range(num_layers - 1):
+                x = self._flatten_and_subsample(hidden_after_layer[i]).detach()
+                y = self._flatten_and_subsample(hidden_after_layer[i + 1]).detach()
+
+                self.club_optimizers[f'hidden_{i}_{i+1}'].zero_grad()
+                loss = self.club_estimators[f'hidden_{i}_{i+1}'].learning_loss(x, y)
+                loss.backward()
+                self.club_optimizers[f'hidden_{i}_{i+1}'].step()
+
+        # Calculate MI penalty
+        for i in range(num_layers - 1):
+            x = self._flatten_and_subsample(hidden_after_layer[i])
+            y = self._flatten_and_subsample(hidden_after_layer[i + 1])
+            mi = self.club_estimators[f'hidden_{i}_{i+1}'](x, y)
+            mi_penalty = mi_penalty + mi
+
+        return mi_penalty
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -531,6 +647,7 @@ class DistilBertForMaskedLM(DistilBertPreTrainedModel):
         inputs_embeds: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        output_residuals: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[MaskedLMOutput, tuple[torch.Tensor, ...]]:
         r"""
@@ -549,12 +666,15 @@ class DistilBertForMaskedLM(DistilBertPreTrainedModel):
             Labels for computing the masked language modeling loss. Indices should be in `[-100, 0, ...,
             config.vocab_size]` (see `input_ids` docstring) Tokens with indices set to `-100` are ignored (masked), the
             loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        output_residuals (`bool`, *optional*, defaults to `False`):
+            Whether to return attention and FFN residuals for each layer.
         """
         dlbrt_output = self.distilbert(
             input_ids=input_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            output_residuals=output_residuals,
             return_dict=True,
             **kwargs,
         )
@@ -568,12 +688,23 @@ class DistilBertForMaskedLM(DistilBertPreTrainedModel):
         if labels is not None:
             mlm_loss = self.mlm_loss_fct(prediction_logits.view(-1, prediction_logits.size(-1)), labels.view(-1))
 
-        return MaskedLMOutput(
+            # Add MI penalty to discourage redundancy (if enabled and hidden states available)
+            if self.mi_penalty_weight > 0.0 and hasattr(dlbrt_output, 'hidden_after_layer'):
+                mi_penalty = self.calculate_mi_penalty(dlbrt_output.hidden_after_layer)
+                mlm_loss = mlm_loss + self.mi_penalty_weight * mi_penalty
+
+        output = MaskedLMOutput(
             loss=mlm_loss,
             logits=prediction_logits,
             hidden_states=dlbrt_output.hidden_states,
             attentions=dlbrt_output.attentions,
         )
+        if output_residuals:
+            output.attn_residuals = dlbrt_output.attn_residuals
+            output.ffn_residuals = dlbrt_output.ffn_residuals
+            output.hidden_after_attn = dlbrt_output.hidden_after_attn
+            output.hidden_after_layer = dlbrt_output.hidden_after_layer
+        return output
 
 
 @auto_docstring(
