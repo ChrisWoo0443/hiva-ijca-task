@@ -23,6 +23,9 @@ logging_dir = os.path.join(logs_base, run_name)
 tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 model = AutoModelForMaskedLM.from_pretrained("distilbert-base-uncased")
 
+model.mi_penalty_weight = 0.001  # Start with small value and adjust based on results
+
+
 block_size = 128
 
 def preprocess_function(examples):
@@ -92,13 +95,43 @@ class CustomTensorBoardCallback(TensorBoardCallback):
         super().on_log(args, state, control, logs=logs, **kwargs)
 
 
-# Custom Trainer to store inputs for MI callback
+# Custom Trainer to store inputs for MI callback and enable MI penalty
 class MITrainer(Trainer):
-    """Custom trainer that stores inputs for MI callback access."""
+    """Custom trainer that stores inputs for MI callback access and enables MI penalty."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.current_inputs = None
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        Override compute_loss to pass output_residuals=True for MI penalty calculation.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+
+        # Enable output_residuals for MI penalty
+        inputs["output_residuals"] = True
+
+        outputs = model(**inputs)
+
+        # Save for later use
+        if labels is not None:
+            if isinstance(outputs, dict):
+                loss = outputs["loss"] if "loss" in outputs else outputs.get("loss")
+            else:
+                loss = outputs.loss
+        else:
+            if isinstance(outputs, dict):
+                logits = outputs["logits"]
+            else:
+                logits = outputs.logits
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = self.label_smoother(outputs, labels, shift_labels=True) if self.label_smoother is not None else None
+
+        return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Override training step to store inputs for MI callback."""
