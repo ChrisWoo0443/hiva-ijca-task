@@ -15,4 +15,5 @@ dependencies = [
     "tqdm>=4.67.1",
     "tensorboardx>=2.6.4",
     "tensorflow>=2.20.0",
+    "tf-keras>=2.20.1",
 ]
